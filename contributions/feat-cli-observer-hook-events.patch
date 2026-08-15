@@ -1,0 +1,1245 @@
+From a2fb73ff2f17fe1f390186ef1ee74f7d07a5f07a Mon Sep 17 00:00:00 2001
+From: Baily <blitheshuo@gmail.com>
+Date: Fri, 14 Aug 2026 22:53:29 -0400
+Subject: [PATCH] feat(cli): add observer lifecycle hook events
+ (PermissionRequest, Stop, SessionEnd)
+
+Extends the hooks system beyond SessionStart with three fire-and-forget
+observer events:
+
+- PermissionRequest: a turn settled on a tool call awaiting approval
+- Stop: a turn settled back to idle (status: ok | error)
+- SessionEnd: the CLI session is shutting down
+
+Observer hooks are executed for their side effects only: stdout is
+ignored (logged at debug level), failures are logged without affecting
+the main flow, and dispatches are never awaited by the running turn.
+Settle detection mirrors TerminalProgressService.trackStream exactly and
+lives in a new HookLifecycleService wired at the same stream boundaries
+in the TUI and headless run controllers; SessionEnd fires from async
+disposal during DI container shutdown.
+
+Config loading reuses the existing user/project merge (project hooks
+stay disabled by default), timeout handling, and sensitive env var
+stripping.
+
+Related to #2684
+
+Signed-off-by: Baily <blitheshuo@gmail.com>
+---
+ .../src/commands/run/run_controller.test.ts   |  11 +
+ .../cli/src/commands/run/run_controller.ts    |   9 +-
+ .../src/commands/tui/tui_controller.test.ts   |  11 +
+ .../cli/src/commands/tui/tui_controller.ts    |   4 +
+ .../cli/src/commands/tui/turn_controller.ts   |   8 +-
+ packages/cli/src/di.ts                        |   2 +
+ .../src/utils/hook_lifecycle_service.test.ts  | 287 ++++++++++++++++++
+ .../cli/src/utils/hook_lifecycle_service.ts   | 112 +++++++
+ .../lib_hooks/src/hook_config_loader.test.ts  |  62 ++++
+ packages/lib_hooks/src/hook_config_loader.ts  |   5 +-
+ packages/lib_hooks/src/hook_service.test.ts   | 161 ++++++++++
+ packages/lib_hooks/src/hook_service.ts        |  73 ++++-
+ packages/lib_hooks/src/index.ts               |   7 +
+ packages/lib_hooks/src/schema.ts              |  15 +-
+ packages/lib_hooks/src/types.ts               |  43 ++-
+ 15 files changed, 794 insertions(+), 16 deletions(-)
+ create mode 100644 packages/cli/src/utils/hook_lifecycle_service.test.ts
+ create mode 100644 packages/cli/src/utils/hook_lifecycle_service.ts
+
+diff --git a/packages/cli/src/commands/run/run_controller.test.ts b/packages/cli/src/commands/run/run_controller.test.ts
+index 4e57889b6..c4ac0b434 100644
+--- a/packages/cli/src/commands/run/run_controller.test.ts
++++ b/packages/cli/src/commands/run/run_controller.test.ts
+@@ -14,6 +14,7 @@ import type { Session, SessionManager } from '../../sessions';
+ import { TerminalProgressService } from '../../utils/terminal_progress_service';
+ import type { NotificationService } from '../../utils/notification_service';
+ import type { SlashCommandService } from '../../slash_commands';
++import type { HookLifecycleService } from '../../utils/hook_lifecycle_service';
+ import { RunController } from './run_controller';
+ import { RunResultWriter } from './run_result_writer';
+ import { runResultSchema } from './run_result_schema';
+@@ -29,6 +30,7 @@ describe('RunController', () => {
+   let mockSessionManager: SessionManager;
+   let mockSession: Session;
+   let mockTerminalProgress: TerminalProgressService;
++  let mockHookLifecycle: HookLifecycleService;
+   let mockSlashCommandService: SlashCommandService;
+   let mockNotificationService: NotificationService;
+ 
+@@ -42,6 +44,7 @@ describe('RunController', () => {
+       mockExitHandler,
+       mockSessionManager,
+       mockTerminalProgress,
++      mockHookLifecycle,
+       mockSlashCommandService,
+       mockNotificationService,
+       new RunResultWriter(mockLogger),
+@@ -99,6 +102,14 @@ describe('RunController', () => {
+       ),
+     });
+ 
++    mockHookLifecycle = createFakePartial<HookLifecycleService>({
++      observeStream: mock<HookLifecycleService['observeStream']>().mockImplementation(
++        async function* (stream) {
++          yield* stream;
++        },
++      ),
++    });
++
+     mockSlashCommandService = createFakePartial<SlashCommandService>({
+       isCommand: mock<SlashCommandService['isCommand']>().mockReturnValue(false),
+       getCommands: mock<SlashCommandService['getCommands']>().mockReturnValue([]),
+diff --git a/packages/cli/src/commands/run/run_controller.ts b/packages/cli/src/commands/run/run_controller.ts
+index 305acbebb..0748a51af 100644
+--- a/packages/cli/src/commands/run/run_controller.ts
++++ b/packages/cli/src/commands/run/run_controller.ts
+@@ -15,6 +15,7 @@ import {
+ import { ParsedCliInput } from '../../parse';
+ import { SessionManager, type Session } from '../../sessions';
+ import { TerminalProgressService } from '../../utils/terminal_progress_service';
++import { HookLifecycleService } from '../../utils/hook_lifecycle_service';
+ import { NotificationService } from '../../utils/notification_service';
+ import { SlashCommandService } from '../../slash_commands';
+ import { RunResultWriter } from './run_result_writer';
+@@ -36,6 +37,7 @@ const DELEGATION_OUTPUT_MAX_LENGTH = 1000;
+     ExitHandler,
+     SessionManager,
+     TerminalProgressService,
++    HookLifecycleService,
+     SlashCommandService,
+     NotificationService,
+     RunResultWriter,
+@@ -59,6 +61,8 @@ export class RunController {
+ 
+   #terminalProgress: TerminalProgressService;
+ 
++  #hookLifecycle: HookLifecycleService;
++
+   #slashCommandService: SlashCommandService;
+ 
+   #notificationService: NotificationService;
+@@ -89,6 +93,7 @@ export class RunController {
+     exitHandler: ExitHandler,
+     sessionManager: SessionManager,
+     terminalProgress: TerminalProgressService,
++    hookLifecycle: HookLifecycleService,
+     slashCommandService: SlashCommandService,
+     notificationService: NotificationService,
+     resultWriter: RunResultWriter,
+@@ -101,6 +106,7 @@ export class RunController {
+     this.#exitHandler = exitHandler;
+     this.#sessionManager = sessionManager;
+     this.#terminalProgress = terminalProgress;
++    this.#hookLifecycle = hookLifecycle;
+     this.#slashCommandService = slashCommandService;
+     this.#notificationService = notificationService;
+     this.#resultWriter = resultWriter;
+@@ -174,9 +180,10 @@ export class RunController {
+ 
+       const stream = session.sendMessageStream(action);
+       const progressTrackedStream = this.#terminalProgress.trackStream(stream);
++      const observedStream = this.#hookLifecycle.observeStream(progressTrackedStream);
+ 
+       let finalElement: ChatElement | undefined;
+-      for await (const item of progressTrackedStream) {
++      for await (const item of observedStream) {
+         // eslint-disable-next-line no-continue
+         if (item.type === AgentEventType.Retry) continue; // ignore retry progress as there is no UI to update in headless mode
+ 
+diff --git a/packages/cli/src/commands/tui/tui_controller.test.ts b/packages/cli/src/commands/tui/tui_controller.test.ts
+index 9e387bfb1..8fbb1a079 100644
+--- a/packages/cli/src/commands/tui/tui_controller.test.ts
++++ b/packages/cli/src/commands/tui/tui_controller.test.ts
+@@ -43,6 +43,7 @@ import type { ExitHandler } from '../../utils/exit';
+ import type { ModelManager } from '../../model_manager';
+ import { ChatSession, type Session, type SessionManager } from '../../sessions';
+ import { TerminalProgressService } from '../../utils/terminal_progress_service';
++import type { HookLifecycleService } from '../../utils/hook_lifecycle_service';
+ import type { NotificationService } from '../../utils/notification_service';
+ import type { DiagnosticsReporter } from '../doctor/diagnostics_reporter';
+ import type { McpStatusController } from './mcp_status_controller';
+@@ -92,6 +93,7 @@ describe('TUIController', () => {
+   let mockModelManager: ModelManager;
+   let mockToolApprovalHandler: ToolApprovalHandler;
+   let mockTerminalProgress: TerminalProgressService;
++  let mockHookLifecycle: HookLifecycleService;
+ 
+   let mockPromptHistoryController: PromptHistoryController;
+   let mockDiagnosticsReporter: DiagnosticsReporter;
+@@ -229,6 +231,14 @@ describe('TUIController', () => {
+       ),
+     });
+ 
++    mockHookLifecycle = createFakePartial<HookLifecycleService>({
++      observeStream: mock<HookLifecycleService['observeStream']>().mockImplementation(
++        async function* (stream) {
++          yield* stream;
++        },
++      ),
++    });
++
+     mockDiagnosticsReporter = createFakePartial<DiagnosticsReporter>({
+       report: mock<DiagnosticsReporter['report']>().mockResolvedValue('# diagnostics-report'),
+     });
+@@ -281,6 +291,7 @@ describe('TUIController', () => {
+       [],
+       mockToolApprovalHandler,
+       mockTerminalProgress,
++      mockHookLifecycle,
+       createFakePartial<AgentsMdResolver>({
+         hasWorkspaceAgentsMd:
+           mock<AgentsMdResolver['hasWorkspaceAgentsMd']>().mockResolvedValue(false),
+diff --git a/packages/cli/src/commands/tui/tui_controller.ts b/packages/cli/src/commands/tui/tui_controller.ts
+index 1de0c3a7f..c378f3aa7 100644
+--- a/packages/cli/src/commands/tui/tui_controller.ts
++++ b/packages/cli/src/commands/tui/tui_controller.ts
+@@ -40,6 +40,7 @@ import { SlashCommandService } from '../../slash_commands';
+ import { SessionManager } from '../../sessions';
+ import { ModelManager } from '../../model_manager';
+ import { TerminalProgressService } from '../../utils/terminal_progress_service';
++import { HookLifecycleService } from '../../utils/hook_lifecycle_service';
+ import { NotificationService } from '../../utils/notification_service';
+ import { DiagnosticsReporter } from '../doctor/diagnostics_reporter';
+ import type { ControllerApi, StateMutation } from './controller_api';
+@@ -73,6 +74,7 @@ import { PluginStartupService } from './plugin_startup_service';
+     collection(DropdownProvider),
+     ToolApprovalHandler,
+     TerminalProgressService,
++    HookLifecycleService,
+     AgentsMdResolver,
+     PromptHistoryController,
+     DiagnosticsReporter,
+@@ -157,6 +159,7 @@ export class TUIController implements Disposable {
+     dropdownProviders: DropdownProvider[],
+     toolApprovalHandler: ToolApprovalHandler,
+     terminalProgress: TerminalProgressService,
++    hookLifecycle: HookLifecycleService,
+     agentsMdResolver: AgentsMdResolver,
+     promptHistoryController: PromptHistoryController,
+     diagnosticsReporter: DiagnosticsReporter,
+@@ -195,6 +198,7 @@ export class TUIController implements Disposable {
+       slashCommandService,
+       aiContextManager,
+       terminalProgress,
++      hookLifecycle,
+       toolApprovalHandler,
+       notificationService,
+       errorHandler,
+diff --git a/packages/cli/src/commands/tui/turn_controller.ts b/packages/cli/src/commands/tui/turn_controller.ts
+index f816aa853..904ec2453 100644
+--- a/packages/cli/src/commands/tui/turn_controller.ts
++++ b/packages/cli/src/commands/tui/turn_controller.ts
+@@ -19,6 +19,7 @@ import { CliContextManager } from '../../ai_context/cli_ai_context_manager';
+ import { SlashCommandService } from '../../slash_commands';
+ import { projectSessionView, type Session, SessionManager } from '../../sessions';
+ import { TerminalProgressService } from '../../utils/terminal_progress_service';
++import { HookLifecycleService } from '../../utils/hook_lifecycle_service';
+ import { NotificationService } from '../../utils/notification_service';
+ import type { ControllerApi } from './controller_api';
+ import { AppStore } from './app_store';
+@@ -54,6 +55,8 @@ export class TurnController {
+ 
+   #terminalProgress: TerminalProgressService;
+ 
++  #hookLifecycle: HookLifecycleService;
++
+   #toolApprovalHandler: ToolApprovalHandler;
+ 
+   #notificationService: NotificationService;
+@@ -80,6 +83,7 @@ export class TurnController {
+     slashCommandService: SlashCommandService,
+     aiContextManager: CliContextManager,
+     terminalProgress: TerminalProgressService,
++    hookLifecycle: HookLifecycleService,
+     toolApprovalHandler: ToolApprovalHandler,
+     notificationService: NotificationService,
+     errorHandler: ErrorHandler,
+@@ -92,6 +96,7 @@ export class TurnController {
+     this.#slashCommandService = slashCommandService;
+     this.#aiContextManager = aiContextManager;
+     this.#terminalProgress = terminalProgress;
++    this.#hookLifecycle = hookLifecycle;
+     this.#toolApprovalHandler = toolApprovalHandler;
+     this.#notificationService = notificationService;
+     this.#errorHandler = errorHandler;
+@@ -303,11 +308,12 @@ export class TurnController {
+ 
+     const stream = session.sendMessageStream(userAction);
+     const progressTrackedStream = this.#terminalProgress.trackStream(stream);
++    const observedStream = this.#hookLifecycle.observeStream(progressTrackedStream);
+ 
+     let lastErrorElement: ChatElement | undefined;
+     const pendingApprovals = new Map<string, ToolCall>();
+ 
+-    for await (const element of progressTrackedStream) {
++    for await (const element of observedStream) {
+       if (element.type === AgentEventType.Retry) {
+         this.#immediateStateSync(); // Retry produces no ChatElement, but we re-sync transient retry status so UI updates.
+         // eslint-disable-next-line no-continue
+diff --git a/packages/cli/src/di.ts b/packages/cli/src/di.ts
+index 7410c5b25..f4ca929cb 100644
+--- a/packages/cli/src/di.ts
++++ b/packages/cli/src/di.ts
+@@ -171,6 +171,7 @@ import { ContextDropdownProvider, SlashCommandDropdownProvider } from './dropdow
+ import { DefaultModelCommandHandler } from './slash_commands/handlers/model_command_handler';
+ import { DefaultToolApprovalHandler } from './commands/tui/tool_approval_handler';
+ import { TerminalProgressService } from './utils/terminal_progress_service';
++import { HookLifecycleService } from './utils/hook_lifecycle_service';
+ import { NotificationService } from './utils/notification_service';
+ import { DefaultPromptHistoryController } from './commands/tui/prompt_history_controller';
+ import { DefaultSkillsCommandHandler } from './slash_commands/handlers/skills_command_handler';
+@@ -492,6 +493,7 @@ export async function initDi<TBackendOpts>(
+     DefaultHookConfigLoader,
+     DefaultHookService,
+     HookSessionStartContextProvider,
++    HookLifecycleService,
+   );
+ 
+   serviceCollection.addClass(DefaultSessionManager, DefaultSessionsHistoryController);
+diff --git a/packages/cli/src/utils/hook_lifecycle_service.test.ts b/packages/cli/src/utils/hook_lifecycle_service.test.ts
+new file mode 100644
+index 000000000..d9c77d3bf
+--- /dev/null
++++ b/packages/cli/src/utils/hook_lifecycle_service.test.ts
+@@ -0,0 +1,287 @@
++import { beforeEach, describe, expect, it, mock } from 'bun:test';
++import { mocked } from '@gitlab-org/test-utils/bun-mocks';
++import { createFakePartial } from '@gitlab-org/test-utils';
++import { TestLogger } from '@gitlab-org/logging';
++import type { HookService } from '@gitlab-org/hooks';
++import type { ChatElement, ErrorMessage, Message, ToolCall } from '@gitlab-org/tui';
++import { AgentEventType, type RetryAgentEvent } from '../backend/backend';
++import type { Session, SessionManager } from '../sessions';
++import type { ParsedCliInput } from '../parse';
++import { HookLifecycleService } from './hook_lifecycle_service';
++
++async function* streamOf(
++  ...elements: (ChatElement | RetryAgentEvent)[]
++): AsyncGenerator<ChatElement | RetryAgentEvent> {
++  for (const el of elements) {
++    yield el;
++  }
++}
++
++// eslint-disable-next-line require-yield
++async function* throwingStream(): AsyncGenerator<ChatElement | RetryAgentEvent> {
++  throw new Error('stream failure');
++}
++
++async function collectAll(
++  gen: AsyncGenerator<ChatElement | RetryAgentEvent>,
++): Promise<(ChatElement | RetryAgentEvent)[]> {
++  const results: (ChatElement | RetryAgentEvent)[] = [];
++  for await (const el of gen) {
++    results.push(el);
++  }
++  return results;
++}
++
++/** Lets fire-and-forget dispatch promises settle. */
++async function flushMicrotasks(): Promise<void> {
++  await new Promise((resolve) => {
++    setTimeout(resolve, 0);
++  });
++}
++
++const retryEvent: RetryAgentEvent = {
++  type: AgentEventType.Retry,
++  attempt: 1,
++  maxAttempts: 5,
++  backoffMs: 3000,
++  timestamp: 1000,
++};
++
++const messageElement = createFakePartial<Message>({
++  type: 'message',
++  role: 'assistant',
++  content: 'hello',
++  isComplete: true,
++});
++
++const errorElement = createFakePartial<ErrorMessage>({
++  type: 'error',
++  error: 'something went wrong',
++});
++
++const approvalElement = createFakePartial<ToolCall>({
++  type: 'tool',
++  name: 'write_file',
++  state: { type: 'approval_request', content: '' },
++});
++
++const completedToolElement = createFakePartial<ToolCall>({
++  type: 'tool',
++  name: 'write_file',
++  state: { type: 'success', output: 'done' },
++});
++
++describe('HookLifecycleService', () => {
++  let service: HookLifecycleService;
++  let mockHookService: HookService;
++  let mockSessionManager: SessionManager;
++
++  beforeEach(() => {
++    mockHookService = createFakePartial<HookService>({
++      runObserverEvent: mock<HookService['runObserverEvent']>().mockResolvedValue(undefined),
++    });
++
++    mockSessionManager = createFakePartial<SessionManager>({
++      getActiveSession: mock<SessionManager['getActiveSession']>().mockReturnValue(
++        createFakePartial<Session>({ sessionId: 'session-1' }),
++      ),
++    });
++
++    service = new HookLifecycleService(
++      new TestLogger(),
++      mockHookService,
++      mockSessionManager,
++      createFakePartial<ParsedCliInput>({ cwd: '/test/cwd', enableProjectHooks: false }),
++    );
++  });
++
++  describe('observeStream', () => {
++    it('passes through all elements unchanged, including retry events', async () => {
++      const elements = await collectAll(
++        service.observeStream(streamOf(retryEvent, messageElement)),
++      );
++
++      expect(elements).toEqual([retryEvent, messageElement]);
++    });
++
++    describe('when the stream completes normally', () => {
++      it('dispatches Stop with status ok', async () => {
++        await collectAll(service.observeStream(streamOf(messageElement)));
++        await flushMicrotasks();
++
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledTimes(1);
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledWith(
++          { name: 'Stop', status: 'ok' },
++          'session-1',
++          '/test/cwd',
++          { enableProjectHooks: false },
++        );
++      });
++    });
++
++    describe('when the stream is empty', () => {
++      it('dispatches Stop with status ok', async () => {
++        await collectAll(service.observeStream(streamOf()));
++        await flushMicrotasks();
++
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledWith(
++          { name: 'Stop', status: 'ok' },
++          'session-1',
++          '/test/cwd',
++          { enableProjectHooks: false },
++        );
++      });
++    });
++
++    describe('when the last element is an error', () => {
++      it('dispatches Stop with status error', async () => {
++        await collectAll(service.observeStream(streamOf(messageElement, errorElement)));
++        await flushMicrotasks();
++
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledTimes(1);
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledWith(
++          { name: 'Stop', status: 'error' },
++          'session-1',
++          '/test/cwd',
++          { enableProjectHooks: false },
++        );
++      });
++    });
++
++    describe('when the last element is a tool awaiting approval', () => {
++      it('dispatches PermissionRequest and no Stop', async () => {
++        await collectAll(service.observeStream(streamOf(messageElement, approvalElement)));
++        await flushMicrotasks();
++
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledTimes(1);
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledWith(
++          { name: 'PermissionRequest' },
++          'session-1',
++          '/test/cwd',
++          { enableProjectHooks: false },
++        );
++      });
++
++      it('ignores a trailing retry event when deciding the settle state', async () => {
++        await collectAll(service.observeStream(streamOf(approvalElement, retryEvent)));
++        await flushMicrotasks();
++
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledWith(
++          { name: 'PermissionRequest' },
++          'session-1',
++          '/test/cwd',
++          { enableProjectHooks: false },
++        );
++      });
++    });
++
++    describe('when the last tool element is not awaiting approval', () => {
++      it('dispatches Stop with status ok', async () => {
++        await collectAll(service.observeStream(streamOf(completedToolElement)));
++        await flushMicrotasks();
++
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledWith(
++          { name: 'Stop', status: 'ok' },
++          'session-1',
++          '/test/cwd',
++          { enableProjectHooks: false },
++        );
++      });
++    });
++
++    describe('when the stream throws', () => {
++      it('dispatches Stop with status error and re-throws', async () => {
++        await expect(collectAll(service.observeStream(throwingStream()))).rejects.toThrow(
++          'stream failure',
++        );
++        await flushMicrotasks();
++
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledTimes(1);
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledWith(
++          { name: 'Stop', status: 'error' },
++          'session-1',
++          '/test/cwd',
++          { enableProjectHooks: false },
++        );
++      });
++    });
++
++    describe('when the consumer abandons the stream early', () => {
++      it('does not dispatch any event (the stream never settled)', async () => {
++        const gen = service.observeStream(streamOf(messageElement, messageElement));
++        await gen.next();
++        await gen.return(undefined);
++        await flushMicrotasks();
++
++        expect(mockHookService.runObserverEvent).not.toHaveBeenCalled();
++      });
++    });
++
++    describe('when hook execution rejects', () => {
++      it('logs the failure without affecting the stream consumer', async () => {
++        mocked(mockHookService.runObserverEvent).mockRejectedValue(new Error('hook exploded'));
++
++        const elements = await collectAll(service.observeStream(streamOf(messageElement)));
++        await flushMicrotasks();
++
++        expect(elements).toEqual([messageElement]);
++      });
++    });
++
++    describe('when there is no active session', () => {
++      it('does not dispatch any event', async () => {
++        mocked(mockSessionManager.getActiveSession).mockReturnValue(undefined);
++
++        await collectAll(service.observeStream(streamOf(messageElement)));
++        await flushMicrotasks();
++
++        expect(mockHookService.runObserverEvent).not.toHaveBeenCalled();
++      });
++    });
++  });
++
++  describe('disposeAsync', () => {
++    it('dispatches SessionEnd for the active session', async () => {
++      await service.disposeAsync();
++
++      expect(mockHookService.runObserverEvent).toHaveBeenCalledWith(
++        { name: 'SessionEnd' },
++        'session-1',
++        '/test/cwd',
++        { enableProjectHooks: false },
++      );
++    });
++
++    it('does not dispatch SessionEnd when no session was created', async () => {
++      mocked(mockSessionManager.getActiveSession).mockReturnValue(undefined);
++
++      await service.disposeAsync();
++
++      expect(mockHookService.runObserverEvent).not.toHaveBeenCalled();
++    });
++
++    it('waits for in-flight hook runs before resolving', async () => {
++      const resolvers: (() => void)[] = [];
++      mocked(mockHookService.runObserverEvent).mockImplementation(
++        () =>
++          new Promise<void>((resolve) => {
++            resolvers.push(resolve);
++          }),
++      );
++
++      await collectAll(service.observeStream(streamOf(messageElement)));
++
++      let disposed = false;
++      const disposal = (async () => {
++        await service.disposeAsync();
++        disposed = true;
++      })();
++      await flushMicrotasks();
++      expect(disposed).toBe(false);
++
++      resolvers.forEach((resolve) => resolve());
++      await disposal;
++      expect(disposed).toBe(true);
++    });
++  });
++});
+diff --git a/packages/cli/src/utils/hook_lifecycle_service.ts b/packages/cli/src/utils/hook_lifecycle_service.ts
+new file mode 100644
+index 000000000..9a72156d1
+--- /dev/null
++++ b/packages/cli/src/utils/hook_lifecycle_service.ts
+@@ -0,0 +1,112 @@
++import type { ChatElement } from '@gitlab-org/tui';
++import { Service, ServiceLifetime, type AsyncDisposable } from '@gitlab/needle';
++import { Logger, withPrefix } from '@gitlab-org/logging';
++import { doNotAwait } from '@gitlab-org/core';
++import { HookService, type ObserverHookEvent } from '@gitlab-org/hooks';
++import { AgentEventType, type RetryAgentEvent } from '../backend/backend';
++import { SessionManager } from '../sessions';
++import { ParsedCliInput } from '../parse';
++
++/**
++ * Fires observer lifecycle hook events at turn boundaries and on shutdown:
++ *
++ * - `PermissionRequest` — the stream settled on a tool call awaiting approval.
++ * - `Stop` — the stream settled back to idle (`status` is `ok` or `error`).
++ * - `SessionEnd` — the CLI session is shutting down.
++ *
++ * The settle conditions mirror `TerminalProgressService.trackStream`
++ * exactly. Hooks are fire-and-forget: dispatches are not awaited by the
++ * consuming turn, stdout is ignored, and failures are logged without ever
++ * affecting the main flow.
++ */
++@Service({
++  dependencies: [Logger, HookService, SessionManager, ParsedCliInput],
++  lifetime: ServiceLifetime.Singleton,
++})
++export class HookLifecycleService implements AsyncDisposable {
++  #logger: Logger;
++
++  #hookService: HookService;
++
++  #sessionManager: SessionManager;
++
++  #cwd: string;
++
++  #enableProjectHooks: boolean;
++
++  #inFlight = new Set<Promise<void>>();
++
++  constructor(
++    logger: Logger,
++    hookService: HookService,
++    sessionManager: SessionManager,
++    cliInput: ParsedCliInput,
++  ) {
++    this.#logger = withPrefix(logger, '[HookLifecycle]');
++    this.#hookService = hookService;
++    this.#sessionManager = sessionManager;
++    this.#cwd = cliInput.cwd;
++    this.#enableProjectHooks = cliInput.enableProjectHooks;
++  }
++
++  /**
++   * Passes the stream through unchanged and dispatches exactly one observer
++   * event when it settles: `PermissionRequest` if the last element is a tool
++   * call awaiting approval, otherwise `Stop`. A stream abandoned early by its
++   * consumer never settles, so no event is dispatched for it.
++   */
++  async *observeStream(
++    stream: AsyncGenerator<ChatElement | RetryAgentEvent>,
++  ): AsyncGenerator<ChatElement | RetryAgentEvent> {
++    let lastElement: ChatElement | undefined;
++
++    try {
++      for await (const element of stream) {
++        yield element;
++        if (element.type !== AgentEventType.Retry) {
++          lastElement = element;
++        }
++      }
++    } catch (error) {
++      this.#dispatch({ name: 'Stop', status: 'error' });
++      throw error;
++    }
++
++    if (lastElement?.type === 'error') {
++      this.#dispatch({ name: 'Stop', status: 'error' });
++    } else if (lastElement?.type === 'tool' && lastElement.state.type === 'approval_request') {
++      this.#dispatch({ name: 'PermissionRequest' });
++    } else {
++      this.#dispatch({ name: 'Stop', status: 'ok' });
++    }
++  }
++
++  /**
++   * Dispatches `SessionEnd` and drains in-flight hook runs so short-lived
++   * hooks get a chance to finish before the process exits. The ExitHandler's
++   * shutdown timeout caps how long this can take.
++   */
++  async disposeAsync(): Promise<void> {
++    this.#dispatch({ name: 'SessionEnd' });
++    await Promise.allSettled([...this.#inFlight]);
++  }
++
++  #dispatch(event: ObserverHookEvent): void {
++    const sessionId = this.#sessionManager.getActiveSession()?.sessionId;
++    if (!sessionId) {
++      this.#logger.debug(`Skipping ${event.name} hooks: no active session`);
++      return;
++    }
++
++    const run = this.#hookService
++      .runObserverEvent(event, sessionId, this.#cwd, {
++        enableProjectHooks: this.#enableProjectHooks,
++      })
++      .catch((error) => {
++        this.#logger.warn(`Failed to run ${event.name} hooks`, error);
++      });
++
++    this.#inFlight.add(run);
++    doNotAwait(run.finally(() => this.#inFlight.delete(run)));
++  }
++}
+diff --git a/packages/lib_hooks/src/hook_config_loader.test.ts b/packages/lib_hooks/src/hook_config_loader.test.ts
+index 50584a29f..8594aa7f7 100644
+--- a/packages/lib_hooks/src/hook_config_loader.test.ts
++++ b/packages/lib_hooks/src/hook_config_loader.test.ts
+@@ -111,6 +111,68 @@ describe('DefaultHookConfigLoader', () => {
+     });
+   });
+ 
++  describe('when config has observer event hooks', () => {
++    beforeEach(() => {
++      mockReadFile.mockImplementation(async (path: unknown) => {
++        if (path === GLOBAL_CONFIG_PATH) {
++          return JSON.stringify({
++            hooks: {
++              PermissionRequest: [{ hooks: [{ type: 'command', command: 'notify approval' }] }],
++              Stop: [{ hooks: [{ type: 'command', command: 'notify stop' }] }],
++              SessionEnd: [{ hooks: [{ type: 'command', command: 'cleanup' }] }],
++              UnknownEvent: [{ hooks: [{ type: 'command', command: 'never parsed' }] }],
++            },
++          }) as never;
++        }
++        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
++      });
++    });
++
++    it('parses PermissionRequest, Stop and SessionEnd hooks', async () => {
++      const config = await loader.load('/test/project');
++      expect(config.hooks?.PermissionRequest).toHaveLength(1);
++      expect(config.hooks?.Stop).toHaveLength(1);
++      expect(config.hooks?.SessionEnd).toHaveLength(1);
++    });
++
++    it('drops unknown event names', async () => {
++      const config = await loader.load('/test/project');
++      expect(config.hooks).not.toHaveProperty('UnknownEvent');
++    });
++  });
++
++  describe('when both global and project config have hooks for an observer event', () => {
++    beforeEach(() => {
++      mockReadFile.mockImplementation(async (path: unknown) => {
++        if (path === GLOBAL_CONFIG_PATH) {
++          return JSON.stringify({
++            hooks: {
++              Stop: [{ hooks: [{ type: 'command', command: 'echo global stop' }] }],
++            },
++          }) as never;
++        }
++        if (path === '/test/project/.gitlab/duo/hooks.json') {
++          return JSON.stringify({
++            hooks: {
++              Stop: [{ hooks: [{ type: 'command', command: 'echo project stop' }] }],
++            },
++          }) as never;
++        }
++        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
++      });
++    });
++
++    it('merges both configs when enableProjectHooks is true', async () => {
++      const config = await loader.load('/test/project', { enableProjectHooks: true });
++      expect(config.hooks?.Stop).toHaveLength(2);
++    });
++
++    it('returns only global hooks when enableProjectHooks is false (default)', async () => {
++      const config = await loader.load('/test/project');
++      expect(config.hooks?.Stop).toHaveLength(1);
++    });
++  });
++
+   describe('when config has invalid hook entries', () => {
+     beforeEach(() => {
+       mockReadFile.mockImplementation(async (path: unknown) => {
+diff --git a/packages/lib_hooks/src/hook_config_loader.ts b/packages/lib_hooks/src/hook_config_loader.ts
+index d1fb448ae..baefeaa0e 100644
+--- a/packages/lib_hooks/src/hook_config_loader.ts
++++ b/packages/lib_hooks/src/hook_config_loader.ts
+@@ -3,7 +3,7 @@ import { join } from 'path';
+ import { createInterfaceId, Implements, Service, ServiceLifetime } from '@gitlab/needle';
+ import { getDuoConfigFilePath } from '@gitlab-org/ai-configuration';
+ import { Logger, withPrefix } from '@gitlab-org/logging';
+-import { parseHooksConfigLeniently } from './schema';
++import { parseHooksConfigLeniently, HOOK_EVENT_NAMES } from './schema';
+ import type { HooksConfig } from './types';
+ 
+ export interface HookConfigLoaderOptions {
+@@ -95,10 +95,9 @@ export class DefaultHookConfigLoader implements HookConfigLoader {
+   }
+ 
+   #mergeConfigs(global: HooksConfig, project: HooksConfig): HooksConfig {
+-    const events = ['SessionStart'] as const;
+     const hooks: NonNullable<HooksConfig['hooks']> = {};
+ 
+-    for (const event of events) {
++    for (const event of HOOK_EVENT_NAMES) {
+       const globalGroups = global.hooks?.[event] ?? [];
+       const projectGroups = project.hooks?.[event] ?? [];
+       const combined = [...globalGroups, ...projectGroups];
+diff --git a/packages/lib_hooks/src/hook_service.test.ts b/packages/lib_hooks/src/hook_service.test.ts
+index efef25a8a..35b538a32 100644
+--- a/packages/lib_hooks/src/hook_service.test.ts
++++ b/packages/lib_hooks/src/hook_service.test.ts
+@@ -238,4 +238,165 @@ describe('DefaultHookService', () => {
+       });
+     });
+   });
++
++  describe('runObserverEvent', () => {
++    describe('when no hooks are configured for the event', () => {
++      it('does not execute any hooks', async () => {
++        await service.runObserverEvent({ name: 'SessionEnd' }, 's1', '/cwd');
++        expect(mockExecutor.executeHook).not.toHaveBeenCalled();
++      });
++    });
++
++    describe('when Stop hooks are configured', () => {
++      beforeEach(() => {
++        const config: HooksConfig = {
++          hooks: {
++            Stop: [{ hooks: [{ type: 'command', command: 'notify.sh' }] }],
++          },
++        };
++        jest.mocked(mockConfigLoader.load).mockResolvedValue(config);
++      });
++
++      it('includes session_id, cwd, event name and status in stdin JSON', async () => {
++        await service.runObserverEvent({ name: 'Stop', status: 'error' }, 's1', '/cwd');
++        const stdinJson = jest.mocked(mockExecutor.executeHook).mock.calls[0][1];
++        expect(JSON.parse(stdinJson)).toEqual({
++          session_id: 's1',
++          cwd: '/cwd',
++          hook_event_name: 'Stop',
++          status: 'error',
++        });
++      });
++
++      it('does not run hooks configured for a different event', async () => {
++        await service.runObserverEvent({ name: 'PermissionRequest' }, 's1', '/cwd');
++        expect(mockExecutor.executeHook).not.toHaveBeenCalled();
++      });
++
++      it('passes dual-prefixed env vars', async () => {
++        await service.runObserverEvent({ name: 'Stop', status: 'ok' }, 's1', '/cwd');
++        const envVars = jest.mocked(mockExecutor.executeHook).mock.calls[0][2];
++        expect(envVars).toEqual(
++          expect.objectContaining({
++            CLAUDE_SESSION_ID: 's1',
++            DUO_SESSION_ID: 's1',
++            CLAUDE_PROJECT_DIR: '/cwd',
++            DUO_PROJECT_DIR: '/cwd',
++          }),
++        );
++      });
++
++      it('passes cwd and options to the config loader', async () => {
++        await service.runObserverEvent({ name: 'Stop', status: 'ok' }, 's1', '/my/project', {
++          enableProjectHooks: true,
++        });
++        expect(mockConfigLoader.load).toHaveBeenCalledWith('/my/project', {
++          enableProjectHooks: true,
++        });
++      });
++    });
++
++    describe('when PermissionRequest hooks are configured', () => {
++      beforeEach(() => {
++        const config: HooksConfig = {
++          hooks: {
++            PermissionRequest: [{ hooks: [{ type: 'command', command: 'alert.sh' }] }],
++          },
++        };
++        jest.mocked(mockConfigLoader.load).mockResolvedValue(config);
++      });
++
++      it('sends the payload without a status field', async () => {
++        await service.runObserverEvent({ name: 'PermissionRequest' }, 's1', '/cwd');
++        const stdinJson = jest.mocked(mockExecutor.executeHook).mock.calls[0][1];
++        expect(JSON.parse(stdinJson)).toEqual({
++          session_id: 's1',
++          cwd: '/cwd',
++          hook_event_name: 'PermissionRequest',
++        });
++      });
++    });
++
++    describe('when hooks are grouped with matchers', () => {
++      beforeEach(() => {
++        const config: HooksConfig = {
++          hooks: {
++            SessionEnd: [
++              { matcher: 'never-matches', hooks: [{ type: 'command', command: 'one.sh' }] },
++              { hooks: [{ type: 'command', command: 'two.sh' }] },
++            ],
++          },
++        };
++        jest.mocked(mockConfigLoader.load).mockResolvedValue(config);
++      });
++
++      it('runs all hooks regardless of matcher (observer events have no matcher input)', async () => {
++        await service.runObserverEvent({ name: 'SessionEnd' }, 's1', '/cwd');
++        expect(mockExecutor.executeHook).toHaveBeenCalledTimes(2);
++      });
++    });
++
++    describe('when a hook prints to stdout', () => {
++      beforeEach(() => {
++        const config: HooksConfig = {
++          hooks: {
++            Stop: [{ hooks: [{ type: 'command', command: 'chatty.sh' }] }],
++          },
++        };
++        jest.mocked(mockConfigLoader.load).mockResolvedValue(config);
++        jest.mocked(mockExecutor.executeHook).mockResolvedValue(
++          makeResult({
++            stdout: 'this output is ignored',
++            parsedOutput: {
++              hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'ignored' },
++            },
++          }),
++        );
++      });
++
++      it('ignores stdout and resolves without a value', async () => {
++        await expect(
++          service.runObserverEvent({ name: 'Stop', status: 'ok' }, 's1', '/cwd'),
++        ).resolves.toBeUndefined();
++      });
++    });
++
++    describe('when a hook exits non-zero', () => {
++      beforeEach(() => {
++        const config: HooksConfig = {
++          hooks: {
++            Stop: [{ hooks: [{ type: 'command', command: 'fail.sh' }] }],
++          },
++        };
++        jest.mocked(mockConfigLoader.load).mockResolvedValue(config);
++        jest
++          .mocked(mockExecutor.executeHook)
++          .mockResolvedValue(makeResult({ exitCode: 1, stderr: 'boom' }));
++      });
++
++      it('resolves without throwing', async () => {
++        await expect(
++          service.runObserverEvent({ name: 'Stop', status: 'ok' }, 's1', '/cwd'),
++        ).resolves.toBeUndefined();
++      });
++    });
++
++    describe('when a hook times out', () => {
++      beforeEach(() => {
++        const config: HooksConfig = {
++          hooks: {
++            SessionEnd: [{ hooks: [{ type: 'command', command: 'slow.sh' }] }],
++          },
++        };
++        jest.mocked(mockConfigLoader.load).mockResolvedValue(config);
++        jest.mocked(mockExecutor.executeHook).mockResolvedValue(makeResult({ timedOut: true }));
++      });
++
++      it('resolves without throwing', async () => {
++        await expect(
++          service.runObserverEvent({ name: 'SessionEnd' }, 's1', '/cwd'),
++        ).resolves.toBeUndefined();
++      });
++    });
++  });
+ });
+diff --git a/packages/lib_hooks/src/hook_service.ts b/packages/lib_hooks/src/hook_service.ts
+index c7634c403..8a637b188 100644
+--- a/packages/lib_hooks/src/hook_service.ts
++++ b/packages/lib_hooks/src/hook_service.ts
+@@ -5,6 +5,8 @@ import type {
+   CommandHook,
+   HookResult,
+   MatcherGroup,
++  ObserverHookEvent,
++  ObserverHookInput,
+   SessionStartInput,
+   SessionStartOutput,
+ } from './types';
+@@ -21,6 +23,19 @@ export interface HookService {
+     source: 'startup' | 'resume',
+     options?: HookServiceOptions,
+   ): Promise<AggregatedSessionStartResult>;
++
++  /**
++   * Runs the hooks configured for an observer lifecycle event
++   * (PermissionRequest, Stop, SessionEnd). Observer hooks are executed for
++   * their side effects only: stdout is ignored and failures are logged
++   * without surfacing to the caller.
++   */
++  runObserverEvent(
++    event: ObserverHookEvent,
++    sessionId: string,
++    cwd: string,
++    options?: HookServiceOptions,
++  ): Promise<void>;
+ }
+ 
+ export const HookService = createInterfaceId<HookService>('HookService');
+@@ -70,6 +85,42 @@ export class DefaultHookService implements HookService {
+       source,
+     };
+ 
++    const results = await this.#executeHooks(matchedHooks, JSON.stringify(input), sessionId, cwd);
++
++    return this.#aggregateSessionStartResults(results);
++  }
++
++  async runObserverEvent(
++    event: ObserverHookEvent,
++    sessionId: string,
++    cwd: string,
++    options?: HookServiceOptions,
++  ): Promise<void> {
++    const config = await this.#configLoader.load(cwd, options);
++    const groups = config.hooks?.[event.name] ?? [];
++
++    // Observer events carry no matcher input; every configured hook runs.
++    const hooks = groups.flatMap((group) => group.hooks);
++    this.#logger.debug(`${event.name}: groups=${groups.length} hooks=${hooks.length}`);
++    if (hooks.length === 0) {
++      return;
++    }
++
++    const input: ObserverHookInput =
++      event.name === 'Stop'
++        ? { session_id: sessionId, cwd, hook_event_name: 'Stop', status: event.status }
++        : { session_id: sessionId, cwd, hook_event_name: event.name };
++
++    const results = await this.#executeHooks(hooks, JSON.stringify(input), sessionId, cwd);
++    this.#logObserverResults(event.name, results);
++  }
++
++  async #executeHooks(
++    hooks: CommandHook[],
++    stdinJson: string,
++    sessionId: string,
++    cwd: string,
++  ): Promise<HookResult[]> {
+     const envVars: Record<string, string> = {
+       DUO_SESSION_ID: sessionId,
+       DUO_PROJECT_DIR: cwd,
+@@ -79,10 +130,9 @@ export class DefaultHookService implements HookService {
+       CLAUDE_PROJECT_DIR: cwd,
+       CLAUDE_ENV_FILE: '',
+     };
+-    const stdinJson = JSON.stringify(input);
+ 
+-    const results = await Promise.all(
+-      matchedHooks.map((hook) =>
++    return Promise.all(
++      hooks.map((hook) =>
+         this.#executor.executeHook(
+           hook.command,
+           stdinJson,
+@@ -92,8 +142,6 @@ export class DefaultHookService implements HookService {
+         ),
+       ),
+     );
+-
+-    return this.#aggregateSessionStartResults(results);
+   }
+ 
+   #matchHooks(groups: MatcherGroup[], value: string): CommandHook[] {
+@@ -120,6 +168,21 @@ export class DefaultHookService implements HookService {
+     }
+   }
+ 
++  /**
++   * Observer hooks are fire-and-forget: stdout is never consumed, so it is
++   * only surfaced at debug level, and failures are logged as warnings.
++   */
++  #logObserverResults(eventName: ObserverHookEvent['name'], results: HookResult[]): void {
++    for (const result of results.filter((r) => !r.timedOut)) {
++      if (result.exitCode !== 0 && result.stderr) {
++        this.#logger.warn(`${eventName} hook non-zero exit (${result.exitCode}): ${result.stderr}`);
++      }
++      if (result.stdout.trim()) {
++        this.#logger.debug(`${eventName} hook stdout (ignored): ${result.stdout.trim()}`);
++      }
++    }
++  }
++
+   #aggregateSessionStartResults(results: HookResult[]): AggregatedSessionStartResult {
+     const actionable = results.filter((r) => !r.timedOut);
+ 
+diff --git a/packages/lib_hooks/src/index.ts b/packages/lib_hooks/src/index.ts
+index 7ed2d732e..5f4a0e7bb 100644
+--- a/packages/lib_hooks/src/index.ts
++++ b/packages/lib_hooks/src/index.ts
+@@ -7,8 +7,15 @@ export type {
+   HooksConfig,
+   MatcherGroup,
+   CommandHook,
++  HookEventName,
++  ObserverHookEventName,
++  ObserverHookEvent,
++  ObserverHookInput,
+   SessionStartInput,
+   SessionStartOutput,
++  PermissionRequestInput,
++  StopInput,
++  SessionEndInput,
+   HookResult,
+   AggregatedSessionStartResult,
+ } from './types';
+diff --git a/packages/lib_hooks/src/schema.ts b/packages/lib_hooks/src/schema.ts
+index 8b7bc28c2..64222cc3d 100644
+--- a/packages/lib_hooks/src/schema.ts
++++ b/packages/lib_hooks/src/schema.ts
+@@ -1,4 +1,5 @@
+ import z from 'zod';
++import type { HookEventName } from './types';
+ 
+ const CommandHookSchema = z.object({
+   type: z.literal('command'),
+@@ -11,6 +12,14 @@ const MatcherGroupSchema = z.object({
+   hooks: z.array(CommandHookSchema),
+ });
+ 
++/** Every hook event key recognized in a hooks.json config. */
++export const HOOK_EVENT_NAMES = [
++  'SessionStart',
++  'PermissionRequest',
++  'Stop',
++  'SessionEnd',
++] as const satisfies readonly HookEventName[];
++
+ /**
+  * Strict schema for the full config — used only when all entries are known-valid.
+  * For lenient parsing that filters invalid entries, use {@link parseHooksConfigLeniently}.
+@@ -19,6 +28,9 @@ export const HooksConfigSchema = z.object({
+   hooks: z
+     .object({
+       SessionStart: z.array(MatcherGroupSchema).optional(),
++      PermissionRequest: z.array(MatcherGroupSchema).optional(),
++      Stop: z.array(MatcherGroupSchema).optional(),
++      SessionEnd: z.array(MatcherGroupSchema).optional(),
+     })
+     .optional(),
+ });
+@@ -37,10 +49,9 @@ export function parseHooksConfigLeniently(
+   const rawHooks = raw.hooks;
+   if (!rawHooks || typeof rawHooks !== 'object') return {};
+ 
+-  const events = ['SessionStart'] as const;
+   const hooks: Record<string, z.infer<typeof MatcherGroupSchema>[]> = {};
+ 
+-  for (const event of events) {
++  for (const event of HOOK_EVENT_NAMES) {
+     const groups = (rawHooks as Record<string, unknown>)[event];
+     if (Array.isArray(groups)) {
+       const validGroups = parseMatcherGroups(groups, event, warn);
+diff --git a/packages/lib_hooks/src/types.ts b/packages/lib_hooks/src/types.ts
+index 874347546..373cb9e22 100644
+--- a/packages/lib_hooks/src/types.ts
++++ b/packages/lib_hooks/src/types.ts
+@@ -1,19 +1,32 @@
+ /**
+  * CC-compatible hook types.
+- * Only SessionStart-relevant types are actively used; other event keys
+- * are kept in the config schema for forward compatibility.
++ *
++ * SessionStart is a context-providing event: its stdout is aggregated and
++ * injected into the session. PermissionRequest, Stop and SessionEnd are
++ * observer events: they are fired for their side effects only, their stdout
++ * is ignored and failures never affect the main flow.
+  */
+ 
++export type HookEventName = 'SessionStart' | ObserverHookEventName;
++
++/** Events that only observe the session lifecycle; their stdout is ignored. */
++export type ObserverHookEventName = 'PermissionRequest' | 'Stop' | 'SessionEnd';
++
+ // --- Configuration types ---
+ 
+ export interface HooksConfig {
+   hooks?: {
+     SessionStart?: MatcherGroup[];
++    /** Fired when a turn settles on a tool call awaiting user approval. */
++    PermissionRequest?: MatcherGroup[];
++    /** Fired when a turn settles back to idle (payload `status` is `ok` or `error`). */
++    Stop?: MatcherGroup[];
++    /** Fired once when the CLI session shuts down. */
++    SessionEnd?: MatcherGroup[];
+     // TODO
+     // UserPromptSubmit?: MatcherGroup[];
+     // PreToolUse?: MatcherGroup[];
+     // PostToolUse?: MatcherGroup[];
+-    // Stop?: MatcherGroup[];
+   };
+ }
+ 
+@@ -37,7 +50,7 @@ interface CommonInput {
+   session_id: string;
+   cwd: string;
+   transcript_path?: string;
+-  hook_event_name: 'SessionStart';
++  hook_event_name: HookEventName;
+ }
+ 
+ export interface SessionStartInput extends CommonInput {
+@@ -47,6 +60,28 @@ export interface SessionStartInput extends CommonInput {
+   agent_type?: string;
+ }
+ 
++export interface PermissionRequestInput extends CommonInput {
++  hook_event_name: 'PermissionRequest';
++}
++
++export interface StopInput extends CommonInput {
++  hook_event_name: 'Stop';
++  /** Whether the turn ended cleanly or with an error. */
++  status: 'ok' | 'error';
++}
++
++export interface SessionEndInput extends CommonInput {
++  hook_event_name: 'SessionEnd';
++}
++
++export type ObserverHookInput = PermissionRequestInput | StopInput | SessionEndInput;
++
++/** Discriminated descriptor of an observer event dispatch, including its payload extras. */
++export type ObserverHookEvent =
++  | { name: 'PermissionRequest' }
++  | { name: 'Stop'; status: 'ok' | 'error' }
++  | { name: 'SessionEnd' };
++
+ // --- Event output types (stdout JSON) ---
+ 
+ export interface SessionStartOutput {
+-- 
+2.50.1 (Apple Git-155)
+
