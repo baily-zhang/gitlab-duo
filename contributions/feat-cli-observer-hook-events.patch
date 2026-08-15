@@ -1,7 +1,7 @@
 From a2fb73ff2f17fe1f390186ef1ee74f7d07a5f07a Mon Sep 17 00:00:00 2001
 From: Baily <blitheshuo@gmail.com>
 Date: Fri, 14 Aug 2026 22:53:29 -0400
-Subject: [PATCH 1/2] feat(cli): add observer lifecycle hook events
+Subject: [PATCH 1/3] feat(cli): add observer lifecycle hook events
  (PermissionRequest, Stop, SessionEnd)
 
 Extends the hooks system beyond SessionStart with three fire-and-forget
@@ -1247,7 +1247,7 @@ index 874347546..373cb9e22 100644
 From bb5cc6809132900fd54a6a9cd03c8af155a21839 Mon Sep 17 00:00:00 2001
 From: Baily Zhang <blitheshuo@gmail.com>
 Date: Sat, 15 Aug 2026 09:43:04 -0400
-Subject: [PATCH 2/2] fix(cli): drain lifecycle hooks before exit and align
+Subject: [PATCH 2/3] fix(cli): drain lifecycle hooks before exit and align
  observer hook cwd
 
 Review follow-ups for the observer lifecycle hook events:
@@ -1720,6 +1720,228 @@ index 373cb9e22..1a21a0a9e 100644
   *
   * SessionStart is a context-providing event: its stdout is aggregated and
   * injected into the session. PermissionRequest, Stop and SessionEnd are
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 21940d9a4ac54eae701e5e25acee62de861ccc47 Mon Sep 17 00:00:00 2001
+From: Baily Zhang <blitheshuo@gmail.com>
+Date: Sat, 15 Aug 2026 13:49:31 -0400
+Subject: [PATCH 3/3] fix(cli): capture session id for SessionEnd and memoize
+ observer hook cwd
+
+AI review follow-ups for the observer lifecycle hook events:
+
+- Remember the session id of the most recent dispatch so SessionEnd can
+  still be attributed to the session that ran when the active session is
+  already cleared during container disposal (falls back to the active
+  session when nothing was captured).
+- Memoize the resolved workspace root so every event of the session
+  reports the same cwd even if the configured workspace changes
+  mid-session, matching what the SessionStart alignment promises.
+- Log a warning when drain() hits its 5s cap, including how many hook
+  runs were still in flight, instead of timing out silently.
+- Document that dispatched events are fire-and-forget notifications
+  with no cross-turn ordering guarantees, so consumers must not treat
+  the sequence as a strict state machine.
+
+Related to #2684
+
+Signed-off-by: Baily Zhang <blitheshuo@gmail.com>
+---
+ .../src/utils/hook_lifecycle_service.test.ts  | 70 ++++++++++++++++++-
+ .../cli/src/utils/hook_lifecycle_service.ts   | 48 ++++++++++---
+ 2 files changed, 107 insertions(+), 11 deletions(-)
+
+diff --git a/packages/cli/src/utils/hook_lifecycle_service.test.ts b/packages/cli/src/utils/hook_lifecycle_service.test.ts
+index c256e8f66..8e54a4832 100644
+--- a/packages/cli/src/utils/hook_lifecycle_service.test.ts
++++ b/packages/cli/src/utils/hook_lifecycle_service.test.ts
+@@ -1,5 +1,6 @@
+-import { beforeEach, describe, expect, it, mock } from 'bun:test';
++import { beforeEach, describe, expect, it, jest, mock } from 'bun:test';
+ import { mocked } from '@gitlab-org/test-utils/bun-mocks';
++import { runAllTimersAsync } from '@gitlab-org/test-utils/bun-timers';
+ import { createFakePartial } from '@gitlab-org/test-utils';
+ import { TestLogger } from '@gitlab-org/logging';
+ import type { ConfigService } from '@gitlab-org/config';
+@@ -268,6 +269,35 @@ describe('HookLifecycleService', () => {
+           { enableProjectHooks: false },
+         );
+       });
++
++      it('memoizes the resolved workspace root across dispatches', async () => {
++        let folders = [{ uri: 'file:///repo/root', name: 'repository root' }];
++        mockConfigService = createFakePartial<ConfigService>({
++          get: mock(() => folders) as ConfigService['get'],
++        });
++        service = new HookLifecycleService(
++          logger,
++          mockHookService,
++          mockSessionManager,
++          mockConfigService,
++          createFakePartial<ParsedCliInput>({ cwd: '/test/cwd', enableProjectHooks: false }),
++        );
++
++        await collectAll(service.observeStream(streamOf(messageElement)));
++        await flushMicrotasks();
++
++        folders = [{ uri: 'file:///other/root', name: 'repository root' }];
++        await collectAll(service.observeStream(streamOf(messageElement)));
++        await flushMicrotasks();
++
++        expect(mockHookService.runObserverEvent).toHaveBeenNthCalledWith(
++          2,
++          { name: 'Stop', status: 'ok' },
++          'session-1',
++          '/repo/root',
++          { enableProjectHooks: false },
++        );
++      });
+     });
+ 
+     describe('when there is no active session', () => {
+@@ -312,6 +342,29 @@ describe('HookLifecycleService', () => {
+       await draining;
+       expect(drained).toBe(true);
+     });
++
++    it('logs a warning when draining times out with hooks still in flight', async () => {
++      jest.useFakeTimers();
++      try {
++        mocked(mockHookService.runObserverEvent).mockImplementation(
++          () => new Promise<void>(() => {}),
++        );
++
++        await collectAll(service.observeStream(streamOf(messageElement)));
++
++        const draining = service.drain();
++        await runAllTimersAsync();
++        await draining;
++
++        expect(
++          logger.warnLogs.some((entry) =>
++            entry.message?.includes('Observer hook drain timed out with 1 hooks in flight'),
++          ),
++        ).toBe(true);
++      } finally {
++        jest.useRealTimers();
++      }
++    });
+   });
+ 
+   describe('disposeAsync', () => {
+@@ -334,6 +387,21 @@ describe('HookLifecycleService', () => {
+       expect(mockHookService.runObserverEvent).not.toHaveBeenCalled();
+     });
+ 
++    it('reuses the session id captured during the turn when the active session is gone', async () => {
++      await collectAll(service.observeStream(streamOf(messageElement)));
++      await flushMicrotasks();
++      mocked(mockSessionManager.getActiveSession).mockReturnValue(undefined);
++
++      await service.disposeAsync();
++
++      expect(mockHookService.runObserverEvent).toHaveBeenCalledWith(
++        { name: 'SessionEnd' },
++        'session-1',
++        '/test/cwd',
++        { enableProjectHooks: false },
++      );
++    });
++
+     it('waits for in-flight hook runs before resolving', async () => {
+       const resolvers: (() => void)[] = [];
+       mocked(mockHookService.runObserverEvent).mockImplementation(
+diff --git a/packages/cli/src/utils/hook_lifecycle_service.ts b/packages/cli/src/utils/hook_lifecycle_service.ts
+index 149c680f5..b353aee7e 100644
+--- a/packages/cli/src/utils/hook_lifecycle_service.ts
++++ b/packages/cli/src/utils/hook_lifecycle_service.ts
+@@ -46,6 +46,16 @@ export class HookLifecycleService implements AsyncDisposable {
+ 
+   #inFlight = new Set<Promise<void>>();
+ 
++  /**
++   * The session id of the most recent dispatch, so `SessionEnd` can still be
++   * attributed to the session that ran even when the active session has
++   * already been cleared by the time the container is disposed.
++   */
++  #capturedSessionId: string | undefined;
++
++  /** Memoized by {@link HookLifecycleService.#resolveCwd}. */
++  #resolvedCwd: string | undefined;
++
+   constructor(
+     logger: Logger,
+     hookService: HookService,
+@@ -107,12 +117,17 @@ export class HookLifecycleService implements AsyncDisposable {
+ 
+     let timer: ReturnType<typeof setTimeout> | undefined;
+     try {
+-      await Promise.race([
+-        Promise.allSettled([...this.#inFlight]),
+-        new Promise<void>((resolve) => {
+-          timer = setTimeout(resolve, DRAIN_TIMEOUT_MS);
++      const outcome = await Promise.race([
++        Promise.allSettled([...this.#inFlight]).then(() => 'settled' as const),
++        new Promise<'timeout'>((resolve) => {
++          timer = setTimeout(() => resolve('timeout'), DRAIN_TIMEOUT_MS);
+         }),
+       ]);
++      if (outcome === 'timeout') {
++        this.#logger.warn(
++          `Observer hook drain timed out with ${this.#inFlight.size} hooks in flight`,
++        );
++      }
+     } finally {
+       clearTimeout(timer);
+     }
+@@ -128,12 +143,22 @@ export class HookLifecycleService implements AsyncDisposable {
+     await this.drain();
+   }
+ 
++  /**
++   * Dispatched events are fire-and-forget notifications. When one stream is
++   * abandoned and a new turn starts, no relative ordering is guaranteed
++   * between their events, so consumers must not treat the event sequence as
++   * a strict state machine.
++   */
+   #dispatch(event: ObserverHookEvent): void {
+-    const sessionId = this.#sessionManager.getActiveSession()?.sessionId;
++    const sessionId =
++      event.name === 'SessionEnd'
++        ? (this.#capturedSessionId ?? this.#sessionManager.getActiveSession()?.sessionId)
++        : this.#sessionManager.getActiveSession()?.sessionId;
+     if (!sessionId) {
+       this.#logger.debug(`Skipping ${event.name} hooks: no active session`);
+       return;
+     }
++    this.#capturedSessionId = sessionId;
+ 
+     const run = this.#hookService
+       .runObserverEvent(event, sessionId, this.#resolveCwd(), {
+@@ -150,13 +175,16 @@ export class HookLifecycleService implements AsyncDisposable {
+   /**
+    * The workspace root resolved during initialization — the same directory
+    * SessionStart hooks receive — so project hook configs are looked up
+-   * consistently when the CLI runs from a subdirectory.
++   * consistently when the CLI runs from a subdirectory. Memoized on first
++   * resolution so every event of the session reports the same cwd even if
++   * the configured workspace changes mid-session.
+    */
+   #resolveCwd(): string {
+-    const folders = this.#configService.get('workspaceFolders') || [];
+-    if (folders.length > 0) {
+-      return workspaceFolderPathFromUri(folders[0].uri);
++    if (this.#resolvedCwd === undefined) {
++      const folders = this.#configService.get('workspaceFolders') || [];
++      this.#resolvedCwd =
++        folders.length > 0 ? workspaceFolderPathFromUri(folders[0].uri) : this.#fallbackCwd;
+     }
+-    return this.#fallbackCwd;
++    return this.#resolvedCwd;
+   }
+ }
 -- 
 2.50.1 (Apple Git-155)
 

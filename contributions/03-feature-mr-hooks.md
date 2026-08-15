@@ -4,7 +4,7 @@
 **Issue**: https://gitlab.com/gitlab-org/editor-extensions/gitlab-lsp/-/work_items/2684
 **Fork**: https://gitlab.com/baily.blithe/gitlab-lsp
 **分支**: `feat-cli-observer-hook-events`
-**Commits**: `a2fb73ff2f17fe1f390186ef1ee74f7d07a5f07a`(初版)+ `bb5cc6809132900fd54a6a9cd03c8af155a21839`(review 修复:B2 drain 时序、S1 cwd 口径、S3 被杀 hook 日志、S4 注释措辞、S5 日志断言)
+**Commits**: `a2fb73ff2f17fe1f390186ef1ee74f7d07a5f07a`(初版)+ `bb5cc6809132900fd54a6a9cd03c8af155a21839`(review 修复:B2 drain 时序、S1 cwd 口径、S3 被杀 hook 日志、S4 注释措辞、S5 日志断言)+ `21940d9a4ac54eae701e5e25acee62de861ccc47`(AI review 修复:SessionEnd 的 sessionId 捕获、cwd 记忆化、drain 超时告警、跨回合顺序语义注释)
 **状态**: Draft MR 已创建:https://gitlab.com/gitlab-org/editor-extensions/gitlab-lsp/-/merge_requests/3905(2026-08-15,`Related to #2684`,allow_collaboration 开)。等只读 review 通过 + CI 绿 + #2684 正面回应后转 Ready 并发跟帖。
 
 ---
@@ -27,8 +27,8 @@
 
 | 文件 | 说明 |
 |---|---|
-| `src/utils/hook_lifecycle_service.ts` **(新)** | `HookLifecycleService`:`observeStream()` 以与 `TerminalProgressService.trackStream` 完全一致的 settle 判定包装流 —— 最后元素为 `tool` 且 `approval_request` → `PermissionRequest`;最后元素为 `error` 或流抛错 → `Stop(status=error)`;否则 → `Stop(status=ok)`;消费方提前放弃迭代(未 settle)不发事件。dispatch 为 fire-and-forget(不 await、catch 全部错误仅记日志),in-flight promise 入 `#inFlight` 集合。公开 `drain()`(等待所有 in-flight hook 完成,5s 封顶)供退出路径调用;实现 needle `AsyncDisposable`:`disposeAsync()` 发出 `SessionEnd` 后复用 `drain()`。cwd 取初始化时解析的 workspace root(`workspaceFolders[0]`,与 SessionStart 同口径),无则回退启动 cwd |
-| `src/utils/hook_lifecycle_service.test.ts` **(新)** | 17 个用例:三事件触发条件、approval settle 只发 PermissionRequest 不发 Stop 的互斥、retry 元素排除、流抛错重抛、hook 拒绝不影响主流程且 TestLogger 记录 warn、无活跃 session 跳过、workspace root cwd 口径、drain 等待 in-flight、disposeAsync 发 SessionEnd 后 drain、提前放弃不发事件 |
+| `src/utils/hook_lifecycle_service.ts` **(新)** | `HookLifecycleService`:`observeStream()` 以与 `TerminalProgressService.trackStream` 完全一致的 settle 判定包装流 —— 最后元素为 `tool` 且 `approval_request` → `PermissionRequest`;最后元素为 `error` 或流抛错 → `Stop(status=error)`;否则 → `Stop(status=ok)`;消费方提前放弃迭代(未 settle)不发事件。dispatch 为 fire-and-forget(不 await、catch 全部错误仅记日志,注释明确不保证跨回合相对顺序),in-flight promise 入 `#inFlight` 集合。公开 `drain()`(等待所有 in-flight hook 完成,5s 封顶,超时记 warn 并含在飞数量)供退出路径调用;实现 needle `AsyncDisposable`:`disposeAsync()` 发出 `SessionEnd` 后复用 `drain()`,`SessionEnd` 优先用最近一次 dispatch 捕获的 sessionId(容器销毁时 activeSession 可能已清)。cwd 取初始化时解析的 workspace root(`workspaceFolders[0]`,与 SessionStart 同口径,首个解析结果记忆化),无则回退启动 cwd |
+| `src/utils/hook_lifecycle_service.test.ts` **(新)** | 20 个用例:三事件触发条件、approval settle 只发 PermissionRequest 不发 Stop 的互斥、retry 元素排除、流抛错重抛、hook 拒绝不影响主流程且 TestLogger 记录 warn、无活跃 session 跳过、workspace root cwd 口径及记忆化、drain 等待 in-flight、drain 超时告警(假时钟)、disposeAsync 发 SessionEnd 后 drain、activeSession 清空后 SessionEnd 复用捕获的 sessionId、提前放弃不发事件 |
 | `src/commands/tui/turn_controller.ts` | 注入 `HookLifecycleService`,在 `trackStream` 外层套 `observeStream`(TUI 交互回合) |
 | `src/commands/tui/tui_controller.ts` | DI 依赖表 + 构造器透传给 TurnController |
 | `src/commands/run/run_controller.ts` | headless `duo run` 同样接线(它同样走 trackStream);**在 `exitHandler.exit()` 前与 catch rethrow 前显式 `await hookLifecycle.drain()`** —— DI teardown 中 HookExecutor 先于本 service 处置并会杀掉仍活跃的 hook 进程,不 drain 则 headless 的 Stop hook 会被静默杀死 |
@@ -37,14 +37,14 @@
 
 **未改动**:`TerminalProgressService` 零改动(仅在调用点外层包一层)。
 
-## 二、验证结果(全部通过,2026-08-15 review 修复后复跑)
+## 二、验证结果(全部通过,2026-08-15 第三次 commit 后复跑)
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
 | Lint/Format | `bun scripts/dev/fix-changed.ts` | prettier ok / eslint ok / markdownlint no files |
-| 全仓 typecheck | `mise exec -- bun run compile` | **112 tasks successful**(turbo 全量) |
+| 受影响包 typecheck | `tsc --noEmit`(packages/cli + packages/lib_hooks) | 两包均 exit 0(第二 commit 时全仓 `bun run compile` 112 tasks successful) |
 | lib_hooks 单测(jest) | `npx jest --config jest.unit.config.ts packages/lib_hooks` | **3 suites / 55 tests passed** |
-| cli 包全量(bun test) | `bun run --filter @gitlab/duo-cli test` | **121/121 test files passed**(含新增 drain 时序测试与 hook_lifecycle_service.test.ts) |
+| cli 包全量(bun test) | `bun run --filter @gitlab/duo-cli test` | **121/121 test files passed**(hook_lifecycle_service.test.ts 20 例) |
 | TUI 包 | `bun run --filter @gitlab-org/tui test` | 24/85 失败,**与本改动无关**:`git stash` 后干净 checkout 复跑同样 24/85 失败(本地沙箱环境性失败,改动不含任何 tui 文件) |
 
 工具链:mise 管理的 bun(按 AGENTS.md 要求 `mise exec` 全程执行)。
