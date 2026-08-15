@@ -1,7 +1,7 @@
 From a2fb73ff2f17fe1f390186ef1ee74f7d07a5f07a Mon Sep 17 00:00:00 2001
 From: Baily <blitheshuo@gmail.com>
 Date: Fri, 14 Aug 2026 22:53:29 -0400
-Subject: [PATCH] feat(cli): add observer lifecycle hook events
+Subject: [PATCH 1/2] feat(cli): add observer lifecycle hook events
  (PermissionRequest, Stop, SessionEnd)
 
 Extends the hooks system beyond SessionStart with three fire-and-forget
@@ -1240,6 +1240,486 @@ index 874347546..373cb9e22 100644
  // --- Event output types (stdout JSON) ---
  
  export interface SessionStartOutput {
+-- 
+2.50.1 (Apple Git-155)
+
+
+From bb5cc6809132900fd54a6a9cd03c8af155a21839 Mon Sep 17 00:00:00 2001
+From: Baily Zhang <blitheshuo@gmail.com>
+Date: Sat, 15 Aug 2026 09:43:04 -0400
+Subject: [PATCH 2/2] fix(cli): drain lifecycle hooks before exit and align
+ observer hook cwd
+
+Review follow-ups for the observer lifecycle hook events:
+
+- Drain in-flight hook runs before ExitHandler.exit() in the headless
+  RunController (success and rethrow paths): DI teardown disposes the
+  HookExecutor before the lifecycle service and kills any still-active
+  hook process, which silently terminated Stop hooks spawned at stream
+  settle. HookLifecycleService now exposes drain(), capped at 5s to
+  mirror the shutdown timeout, and disposeAsync() reuses it.
+- Resolve observer hook cwd from the configured workspace root
+  (workspaceFolders[0], the same directory SessionStart hooks receive)
+  instead of the raw launch cwd, so project hook configs are found
+  consistently when running from a subdirectory.
+- Always warn on non-zero observer hook exits, even without stderr, so
+  killed or signal-terminated hooks are not silent.
+- Reword the types header to CC-style (PermissionRequest is not a
+  Claude Code event name).
+- Tests: exit-ordering tests for RunController draining, drain() unit
+  tests, workspace-root cwd test, TestLogger assertions for hook
+  failure and empty-stderr warnings.
+
+Related to #2684
+
+Signed-off-by: Baily Zhang <blitheshuo@gmail.com>
+---
+ .../src/commands/run/run_controller.test.ts   | 37 +++++++++
+ .../cli/src/commands/run/run_controller.ts    |  9 +++
+ .../src/utils/hook_lifecycle_service.test.ts  | 76 ++++++++++++++++++-
+ .../cli/src/utils/hook_lifecycle_service.ts   | 62 +++++++++++++--
+ packages/lib_hooks/src/hook_service.test.ts   | 37 ++++++++-
+ packages/lib_hooks/src/hook_service.ts        |  9 ++-
+ packages/lib_hooks/src/types.ts               |  2 +-
+ 7 files changed, 220 insertions(+), 12 deletions(-)
+
+diff --git a/packages/cli/src/commands/run/run_controller.test.ts b/packages/cli/src/commands/run/run_controller.test.ts
+index c4ac0b434..86f89aa7f 100644
+--- a/packages/cli/src/commands/run/run_controller.test.ts
++++ b/packages/cli/src/commands/run/run_controller.test.ts
+@@ -108,6 +108,7 @@ describe('RunController', () => {
+           yield* stream;
+         },
+       ),
++      drain: mock<HookLifecycleService['drain']>().mockResolvedValue(undefined),
+     });
+ 
+     mockSlashCommandService = createFakePartial<SlashCommandService>({
+@@ -338,6 +339,42 @@ describe('RunController', () => {
+     describe('when initialized with `run` command', () => {
+       beforeEach(() => controller.initialize());
+ 
++      describe('lifecycle hook draining', () => {
++        it('does not exit until in-flight lifecycle hooks are drained', async () => {
++          mocked(mockSession.sendMessageStream).mockReturnValue(asyncGeneratorFromArray([]));
++
++          let resolveDrain!: () => void;
++          mocked(mockHookLifecycle.drain).mockImplementation(
++            () =>
++              new Promise<void>((resolve) => {
++                resolveDrain = resolve;
++              }),
++          );
++
++          const executing = controller.execute();
++          await new Promise((resolve) => {
++            setTimeout(resolve, 0);
++          });
++          expect(mockHookLifecycle.drain).toHaveBeenCalled();
++          expect(mockExitHandler.exit).not.toHaveBeenCalled();
++
++          resolveDrain();
++          await executing;
++          expect(mockExitHandler.exit).toHaveBeenCalledWith(0);
++        });
++
++        it('drains lifecycle hooks before rethrowing a failed run', async () => {
++          mocked(mockSession.sendMessageStream).mockImplementation(() => {
++            throw new Error('stream blew up');
++          });
++
++          await expect(controller.execute()).rejects.toThrow('stream blew up');
++
++          expect(mockHookLifecycle.drain).toHaveBeenCalled();
++          expect(mockExitHandler.exit).not.toHaveBeenCalled();
++        });
++      });
++
+       it('should open the stream with the goal as the initial prompt', async () => {
+         mocked(mockSession.sendMessageStream).mockReturnValue(asyncGeneratorFromArray([]));
+         await controller.execute();
+diff --git a/packages/cli/src/commands/run/run_controller.ts b/packages/cli/src/commands/run/run_controller.ts
+index 0748a51af..bede75bd4 100644
+--- a/packages/cli/src/commands/run/run_controller.ts
++++ b/packages/cli/src/commands/run/run_controller.ts
+@@ -217,6 +217,11 @@ export class RunController {
+         this.#resultWriter.writeText(session);
+       }
+ 
++      // The DI teardown triggered by exit() disposes the HookExecutor before
++      // the lifecycle service, killing any hook process still active — drain
++      // first so the Stop hooks dispatched at stream settle can finish.
++      await this.#hookLifecycle.drain();
++
+       await this.#exitHandler.exit(exitCode);
+     } catch (error) {
+       const message = error instanceof Error ? error.message : String(error);
+@@ -239,6 +244,10 @@ export class RunController {
+         this.#resultWriter.writeJson(session, { status: 'error', exitCode: 1, error: message });
+       }
+ 
++      // Same reason as the success path: the rethrown error ends in an exit
++      // whose DI teardown would kill a just-spawned Stop hook.
++      await this.#hookLifecycle.drain();
++
+       throw error;
+     }
+   }
+diff --git a/packages/cli/src/utils/hook_lifecycle_service.test.ts b/packages/cli/src/utils/hook_lifecycle_service.test.ts
+index d9c77d3bf..c256e8f66 100644
+--- a/packages/cli/src/utils/hook_lifecycle_service.test.ts
++++ b/packages/cli/src/utils/hook_lifecycle_service.test.ts
+@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, mock } from 'bun:test';
+ import { mocked } from '@gitlab-org/test-utils/bun-mocks';
+ import { createFakePartial } from '@gitlab-org/test-utils';
+ import { TestLogger } from '@gitlab-org/logging';
++import type { ConfigService } from '@gitlab-org/config';
+ import type { HookService } from '@gitlab-org/hooks';
+ import type { ChatElement, ErrorMessage, Message, ToolCall } from '@gitlab-org/tui';
+ import { AgentEventType, type RetryAgentEvent } from '../backend/backend';
+@@ -73,10 +74,14 @@ const completedToolElement = createFakePartial<ToolCall>({
+ 
+ describe('HookLifecycleService', () => {
+   let service: HookLifecycleService;
++  let logger: TestLogger;
+   let mockHookService: HookService;
+   let mockSessionManager: SessionManager;
++  let mockConfigService: ConfigService;
+ 
+   beforeEach(() => {
++    logger = new TestLogger();
++
+     mockHookService = createFakePartial<HookService>({
+       runObserverEvent: mock<HookService['runObserverEvent']>().mockResolvedValue(undefined),
+     });
+@@ -87,10 +92,15 @@ describe('HookLifecycleService', () => {
+       ),
+     });
+ 
++    mockConfigService = createFakePartial<ConfigService>({
++      get: mock().mockReturnValue(undefined) as ConfigService['get'],
++    });
++
+     service = new HookLifecycleService(
+-      new TestLogger(),
++      logger,
+       mockHookService,
+       mockSessionManager,
++      mockConfigService,
+       createFakePartial<ParsedCliInput>({ cwd: '/test/cwd', enableProjectHooks: false }),
+     );
+   });
+@@ -225,6 +235,38 @@ describe('HookLifecycleService', () => {
+         await flushMicrotasks();
+ 
+         expect(elements).toEqual([messageElement]);
++        const warning = logger.warnLogs.find((entry) =>
++          entry.message?.includes('Failed to run Stop hooks'),
++        );
++        expect(warning).toBeDefined();
++        expect(warning?.error).toBeInstanceOf(Error);
++      });
++    });
++
++    describe('when a workspace root is configured', () => {
++      it('dispatches with the workspace folder path instead of the launch cwd', async () => {
++        mockConfigService = createFakePartial<ConfigService>({
++          get: mock().mockReturnValue([
++            { uri: 'file:///repo/root', name: 'repository root' },
++          ]) as ConfigService['get'],
++        });
++        service = new HookLifecycleService(
++          logger,
++          mockHookService,
++          mockSessionManager,
++          mockConfigService,
++          createFakePartial<ParsedCliInput>({ cwd: '/test/cwd', enableProjectHooks: false }),
++        );
++
++        await collectAll(service.observeStream(streamOf(messageElement)));
++        await flushMicrotasks();
++
++        expect(mockHookService.runObserverEvent).toHaveBeenCalledWith(
++          { name: 'Stop', status: 'ok' },
++          'session-1',
++          '/repo/root',
++          { enableProjectHooks: false },
++        );
+       });
+     });
+ 
+@@ -240,6 +282,38 @@ describe('HookLifecycleService', () => {
+     });
+   });
+ 
++  describe('drain', () => {
++    it('resolves immediately when no hook runs are in flight', async () => {
++      await service.drain();
++
++      expect(mockHookService.runObserverEvent).not.toHaveBeenCalled();
++    });
++
++    it('waits for in-flight hook runs before resolving', async () => {
++      const resolvers: (() => void)[] = [];
++      mocked(mockHookService.runObserverEvent).mockImplementation(
++        () =>
++          new Promise<void>((resolve) => {
++            resolvers.push(resolve);
++          }),
++      );
++
++      await collectAll(service.observeStream(streamOf(messageElement)));
++
++      let drained = false;
++      const draining = (async () => {
++        await service.drain();
++        drained = true;
++      })();
++      await flushMicrotasks();
++      expect(drained).toBe(false);
++
++      resolvers.forEach((resolve) => resolve());
++      await draining;
++      expect(drained).toBe(true);
++    });
++  });
++
+   describe('disposeAsync', () => {
+     it('dispatches SessionEnd for the active session', async () => {
+       await service.disposeAsync();
+diff --git a/packages/cli/src/utils/hook_lifecycle_service.ts b/packages/cli/src/utils/hook_lifecycle_service.ts
+index 9a72156d1..149c680f5 100644
+--- a/packages/cli/src/utils/hook_lifecycle_service.ts
++++ b/packages/cli/src/utils/hook_lifecycle_service.ts
+@@ -1,12 +1,20 @@
+ import type { ChatElement } from '@gitlab-org/tui';
+ import { Service, ServiceLifetime, type AsyncDisposable } from '@gitlab/needle';
+ import { Logger, withPrefix } from '@gitlab-org/logging';
++import { ConfigService } from '@gitlab-org/config';
+ import { doNotAwait } from '@gitlab-org/core';
++import { workspaceFolderPathFromUri } from '@gitlab-org/fs';
+ import { HookService, type ObserverHookEvent } from '@gitlab-org/hooks';
+ import { AgentEventType, type RetryAgentEvent } from '../backend/backend';
+ import { SessionManager } from '../sessions';
+ import { ParsedCliInput } from '../parse';
+ 
++/**
++ * Caps {@link HookLifecycleService.drain} so a slow hook cannot stall
++ * shutdown; mirrors the ExitHandler's own shutdown timeout.
++ */
++const DRAIN_TIMEOUT_MS = 5_000;
++
+ /**
+  * Fires observer lifecycle hook events at turn boundaries and on shutdown:
+  *
+@@ -20,7 +28,7 @@ import { ParsedCliInput } from '../parse';
+  * affecting the main flow.
+  */
+ @Service({
+-  dependencies: [Logger, HookService, SessionManager, ParsedCliInput],
++  dependencies: [Logger, HookService, SessionManager, ConfigService, ParsedCliInput],
+   lifetime: ServiceLifetime.Singleton,
+ })
+ export class HookLifecycleService implements AsyncDisposable {
+@@ -30,7 +38,9 @@ export class HookLifecycleService implements AsyncDisposable {
+ 
+   #sessionManager: SessionManager;
+ 
+-  #cwd: string;
++  #configService: ConfigService;
++
++  #fallbackCwd: string;
+ 
+   #enableProjectHooks: boolean;
+ 
+@@ -40,12 +50,14 @@ export class HookLifecycleService implements AsyncDisposable {
+     logger: Logger,
+     hookService: HookService,
+     sessionManager: SessionManager,
++    configService: ConfigService,
+     cliInput: ParsedCliInput,
+   ) {
+     this.#logger = withPrefix(logger, '[HookLifecycle]');
+     this.#hookService = hookService;
+     this.#sessionManager = sessionManager;
+-    this.#cwd = cliInput.cwd;
++    this.#configService = configService;
++    this.#fallbackCwd = cliInput.cwd;
+     this.#enableProjectHooks = cliInput.enableProjectHooks;
+   }
+ 
+@@ -81,14 +93,39 @@ export class HookLifecycleService implements AsyncDisposable {
+     }
+   }
+ 
++  /**
++   * Waits for every dispatched hook run to settle, capped at
++   * {@link DRAIN_TIMEOUT_MS}. Exit paths must call this before triggering DI
++   * teardown: the HookExecutor disposes earlier than this service and kills
++   * any hook process still active, so an undrained fire-and-forget dispatch
++   * (e.g. the Stop hooks of a headless run) would be silently terminated.
++   */
++  async drain(): Promise<void> {
++    if (this.#inFlight.size === 0) {
++      return;
++    }
++
++    let timer: ReturnType<typeof setTimeout> | undefined;
++    try {
++      await Promise.race([
++        Promise.allSettled([...this.#inFlight]),
++        new Promise<void>((resolve) => {
++          timer = setTimeout(resolve, DRAIN_TIMEOUT_MS);
++        }),
++      ]);
++    } finally {
++      clearTimeout(timer);
++    }
++  }
++
+   /**
+    * Dispatches `SessionEnd` and drains in-flight hook runs so short-lived
+    * hooks get a chance to finish before the process exits. The ExitHandler's
+-   * shutdown timeout caps how long this can take.
++   * shutdown timeout caps this in addition to the drain cap.
+    */
+   async disposeAsync(): Promise<void> {
+     this.#dispatch({ name: 'SessionEnd' });
+-    await Promise.allSettled([...this.#inFlight]);
++    await this.drain();
+   }
+ 
+   #dispatch(event: ObserverHookEvent): void {
+@@ -99,7 +136,7 @@ export class HookLifecycleService implements AsyncDisposable {
+     }
+ 
+     const run = this.#hookService
+-      .runObserverEvent(event, sessionId, this.#cwd, {
++      .runObserverEvent(event, sessionId, this.#resolveCwd(), {
+         enableProjectHooks: this.#enableProjectHooks,
+       })
+       .catch((error) => {
+@@ -109,4 +146,17 @@ export class HookLifecycleService implements AsyncDisposable {
+     this.#inFlight.add(run);
+     doNotAwait(run.finally(() => this.#inFlight.delete(run)));
+   }
++
++  /**
++   * The workspace root resolved during initialization — the same directory
++   * SessionStart hooks receive — so project hook configs are looked up
++   * consistently when the CLI runs from a subdirectory.
++   */
++  #resolveCwd(): string {
++    const folders = this.#configService.get('workspaceFolders') || [];
++    if (folders.length > 0) {
++      return workspaceFolderPathFromUri(folders[0].uri);
++    }
++    return this.#fallbackCwd;
++  }
+ }
+diff --git a/packages/lib_hooks/src/hook_service.test.ts b/packages/lib_hooks/src/hook_service.test.ts
+index 35b538a32..1db233ae3 100644
+--- a/packages/lib_hooks/src/hook_service.test.ts
++++ b/packages/lib_hooks/src/hook_service.test.ts
+@@ -8,6 +8,7 @@ import { DefaultHookService } from './hook_service';
+ 
+ describe('DefaultHookService', () => {
+   let service: DefaultHookService;
++  let testLogger: TestLogger;
+   let mockConfigLoader: HookConfigLoader;
+   let mockExecutor: HookExecutor;
+ 
+@@ -21,6 +22,8 @@ describe('DefaultHookService', () => {
+   });
+ 
+   beforeEach(() => {
++    testLogger = new TestLogger();
++
+     mockConfigLoader = createFakePartial<HookConfigLoader>({
+       load: jest.fn<HookConfigLoader['load']>().mockResolvedValue({ hooks: {} }),
+     });
+@@ -29,7 +32,7 @@ describe('DefaultHookService', () => {
+       executeHook: jest.fn<HookExecutor['executeHook']>().mockResolvedValue(makeResult()),
+     });
+ 
+-    service = new DefaultHookService(new TestLogger(), mockConfigLoader, mockExecutor);
++    service = new DefaultHookService(testLogger, mockConfigLoader, mockExecutor);
+   });
+ 
+   describe('runSessionStart', () => {
+@@ -379,6 +382,38 @@ describe('DefaultHookService', () => {
+           service.runObserverEvent({ name: 'Stop', status: 'ok' }, 's1', '/cwd'),
+         ).resolves.toBeUndefined();
+       });
++
++      it('logs a warning including stderr', async () => {
++        await service.runObserverEvent({ name: 'Stop', status: 'ok' }, 's1', '/cwd');
++        expect(
++          testLogger.warnLogs.some((entry) =>
++            entry.message?.includes('Stop hook non-zero exit (1): boom'),
++          ),
++        ).toBe(true);
++      });
++    });
++
++    describe('when a hook is terminated without stderr (e.g. killed by a signal)', () => {
++      beforeEach(() => {
++        const config: HooksConfig = {
++          hooks: {
++            Stop: [{ hooks: [{ type: 'command', command: 'killed.sh' }] }],
++          },
++        };
++        jest.mocked(mockConfigLoader.load).mockResolvedValue(config);
++        jest
++          .mocked(mockExecutor.executeHook)
++          .mockResolvedValue(makeResult({ exitCode: 1, stderr: '' }));
++      });
++
++      it('still logs a warning so the failure is not silent', async () => {
++        await service.runObserverEvent({ name: 'Stop', status: 'ok' }, 's1', '/cwd');
++        expect(
++          testLogger.warnLogs.some((entry) =>
++            entry.message?.includes('Stop hook non-zero exit (1)'),
++          ),
++        ).toBe(true);
++      });
+     });
+ 
+     describe('when a hook times out', () => {
+diff --git a/packages/lib_hooks/src/hook_service.ts b/packages/lib_hooks/src/hook_service.ts
+index 8a637b188..e91c0ae59 100644
+--- a/packages/lib_hooks/src/hook_service.ts
++++ b/packages/lib_hooks/src/hook_service.ts
+@@ -170,12 +170,15 @@ export class DefaultHookService implements HookService {
+ 
+   /**
+    * Observer hooks are fire-and-forget: stdout is never consumed, so it is
+-   * only surfaced at debug level, and failures are logged as warnings.
++   * only surfaced at debug level, and failures are logged as warnings. A
++   * non-zero exit is always logged — even without stderr — so killed or
++   * signal-terminated hooks do not fail silently.
+    */
+   #logObserverResults(eventName: ObserverHookEvent['name'], results: HookResult[]): void {
+     for (const result of results.filter((r) => !r.timedOut)) {
+-      if (result.exitCode !== 0 && result.stderr) {
+-        this.#logger.warn(`${eventName} hook non-zero exit (${result.exitCode}): ${result.stderr}`);
++      if (result.exitCode !== 0) {
++        const stderrSuffix = result.stderr ? `: ${result.stderr}` : '';
++        this.#logger.warn(`${eventName} hook non-zero exit (${result.exitCode})${stderrSuffix}`);
+       }
+       if (result.stdout.trim()) {
+         this.#logger.debug(`${eventName} hook stdout (ignored): ${result.stdout.trim()}`);
+diff --git a/packages/lib_hooks/src/types.ts b/packages/lib_hooks/src/types.ts
+index 373cb9e22..1a21a0a9e 100644
+--- a/packages/lib_hooks/src/types.ts
++++ b/packages/lib_hooks/src/types.ts
+@@ -1,5 +1,5 @@
+ /**
+- * CC-compatible hook types.
++ * CC-style hook types.
+  *
+  * SessionStart is a context-providing event: its stdout is aggregated and
+  * injected into the session. PermissionRequest, Stop and SessionEnd are
 -- 
 2.50.1 (Apple Git-155)
 
