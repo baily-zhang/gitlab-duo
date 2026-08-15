@@ -14,7 +14,7 @@ GitLab Duo CLI (`duo` / `glab duo cli`) is GitLab's interactive terminal coding 
 | # | What | Where | Status |
 |---|------|-------|--------|
 | 1 | Proposal: observer lifecycle hook events (`PermissionRequest`, `Stop`/`SessionEnd`) for terminal multiplexer and status-bar integrations | [gitlab-lsp#2684 comment](https://gitlab.com/gitlab-org/editor-extensions/gitlab-lsp/-/work_items/2684#note_3689352199) | Posted 2026-08-14 |
-| 2 | Docs: document the OSC `9;4` terminal progress signals as a public contract | `doc/user/gitlab_duo_cli/reference.md` in gitlab-org/gitlab ([draft](contributions/02-docs-mr-terminal-progress.md)) | Drafted, lint-verified against the official markdownlint/Vale configs; awaiting community-fork access to submit |
+| 2 | Docs: document the OSC `9;4` terminal progress signals as a public contract | [MR gitlab-org/gitlab!250315](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/250315) · [draft notes](contributions/02-docs-mr-terminal-progress.md) | Submitted 2026-08-15 (lint-verified against the official markdownlint/Vale configs; via the gitlab-community fork) |
 | 3 | Feature: implement the observer hook events (`PermissionRequest`, `Stop`, `SessionEnd`) | [Draft MR gitlab-lsp!3905](https://gitlab.com/gitlab-org/editor-extensions/gitlab-lsp/-/merge_requests/3905) · [patch](contributions/feat-cli-observer-hook-events.patch) · [notes](contributions/03-feature-mr-hooks.md) | Draft MR open (15 files, +794/−16; under independent review before marking ready) |
 
 ## Technical notes: the OSC `9;4` signals
