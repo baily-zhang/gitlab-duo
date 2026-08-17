@@ -13,9 +13,9 @@ GitLab Duo CLI (`duo` / `glab duo cli`) is GitLab's interactive terminal coding 
 
 | # | What | Where | Status |
 |---|------|-------|--------|
-| 1 | Proposal: observer lifecycle hook events (`PermissionRequest`, `Stop`/`SessionEnd`) for terminal multiplexer and status-bar integrations | [gitlab-lsp#2684 comment](https://gitlab.com/gitlab-org/editor-extensions/gitlab-lsp/-/work_items/2684#note_3689352199) | Posted 2026-08-14 |
-| 2 | Docs: document the OSC `9;4` terminal progress signals as a public contract | [MR gitlab-org/gitlab!250315](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/250315) · [draft notes](contributions/02-docs-mr-terminal-progress.md) | Submitted 2026-08-15 (lint-verified against the official markdownlint/Vale configs; via the gitlab-community fork) |
-| 3 | Feature: implement the observer hook events (`PermissionRequest`, `Stop`, `SessionEnd`) | [Draft MR gitlab-lsp!3905](https://gitlab.com/gitlab-org/editor-extensions/gitlab-lsp/-/merge_requests/3905) · [patch](contributions/feat-cli-observer-hook-events.patch) · [notes](contributions/03-feature-mr-hooks.md) | Draft MR open; adversarially reviewed by my agent pipeline and by GitLab Duo Code Review; all findings addressed (3 commits) |
+| 1 | Proposal: observer lifecycle hook events (`PermissionRequest`, `Stop`/`SessionEnd`) for terminal multiplexer and status-bar integrations | [gitlab-lsp#2684 comment](https://gitlab.com/gitlab-org/editor-extensions/gitlab-lsp/-/work_items/2684#note_3689352199) | Posted 2026-08-14; implementation MR !3905 posted 2026-08-15 |
+| 2 | Docs: document the OSC `9;4` terminal progress signals as a public contract | [MR gitlab-org/gitlab!250315](https://gitlab.com/gitlab-org/gitlab/-/merge_requests/250315) · [draft notes](contributions/02-docs-mr-terminal-progress.md) | Technical Writing review passed 2026-08-17 — approved, auto-merge enabled. Submitted 2026-08-15 via the gitlab-community fork |
+| 3 | Feature: implement the observer hook events (`PermissionRequest`, `Stop`, `SessionEnd`) | [MR gitlab-lsp!3905](https://gitlab.com/gitlab-org/editor-extensions/gitlab-lsp/-/merge_requests/3905) · [patch](contributions/feat-cli-observer-hook-events.patch) · [notes](contributions/03-feature-mr-hooks.md) | In review — rebased onto latest main 2026-08-17, human reviewer assigned. Adversarially reviewed pre-submission by my agent pipeline and GitLab Duo Code Review; all findings addressed |
 
 ## Technical notes: the OSC `9;4` signals
 
